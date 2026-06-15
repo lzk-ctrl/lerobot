@@ -1,0 +1,4 @@
+1. 获取最新 observation
+2. 调一次 VLA 推理
+3. 发出 1 条 cmd_vel
+4. 等 0.1s
