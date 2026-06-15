@@ -8,6 +8,7 @@ import socketserver
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -161,7 +162,9 @@ class PI05RequestHandler(socketserver.BaseRequestHandler):
                     if self.server.record_infer_request_and_should_shutdown():
                         threading.Thread(target=self.server.shutdown, daemon=True).start()
             except Exception as exc:
-                send_message(sock, {"ok": False, "error": str(exc)})
+                tb = traceback.format_exc()
+                print(tb, file=sys.stderr, flush=True)
+                send_message(sock, {"ok": False, "error": str(exc), "traceback": tb})
 
 
 def main() -> None:
