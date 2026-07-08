@@ -12,6 +12,7 @@ import socket
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import urlopen
@@ -213,6 +214,15 @@ def parse_args() -> argparse.Namespace:
         help="How many actions to request from the server.",
     )
     parser.add_argument(
+        "--batch",
+        type=int,
+        default=1,
+        help=(
+            "How many concurrent inference requests to send per cycle. "
+            "When batch > 1, only each request's inference_time_ms is printed."
+        ),
+    )
+    parser.add_argument(
         "--num-action-samples",
         type=int,
         default=None,
@@ -287,6 +297,34 @@ def request_action_chunk(args: argparse.Namespace, observation: dict[str, np.nda
 
     response["roundtrip_time_ms"] = roundtrip_ms
     return response
+
+
+def request_action_chunks(
+    args: argparse.Namespace,
+    observation: dict[str, np.ndarray],
+) -> list[dict]:
+    if args.batch == 1:
+        return [request_action_chunk(args, observation)]
+
+    responses: list[dict | None] = [None] * args.batch
+    errors: list[tuple[int, Exception]] = []
+    with ThreadPoolExecutor(max_workers=args.batch) as executor:
+        future_to_index = {
+            executor.submit(request_action_chunk, args, observation): batch_request_index
+            for batch_request_index in range(args.batch)
+        }
+        for future in as_completed(future_to_index):
+            batch_request_index = future_to_index[future]
+            try:
+                responses[batch_request_index] = future.result()
+            except Exception as exc:
+                errors.append((batch_request_index, exc))
+
+    if errors:
+        batch_request_index, exc = errors[0]
+        raise RuntimeError(f"batch_request_{batch_request_index} failed: {exc}") from exc
+
+    return [response for response in responses if response is not None]
 
 
 def capture_observation_via_snapshot_server(
@@ -652,7 +690,31 @@ def handle_action(
     return (time.perf_counter() - t0) * 1000.0, cmd_vel
 
 
+def execute_batch_timing_cycle(args: argparse.Namespace) -> None:
+    observation, _metadata = load_observation(args)
+    responses = request_action_chunks(args, observation)
+
+    cycle_prefix = ""
+    if args.continuous:
+        cycle_prefix = f"cycle_{getattr(args, '_current_cycle_index', 1)}_"
+
+    for request_index, response in enumerate(responses):
+        if not response.get("ok", False):
+            raise RuntimeError(
+                f"batch_request_{request_index} failed: "
+                f"{response.get('error', 'Unknown PI05 server error')}"
+            )
+        print(
+            f"{cycle_prefix}request_{request_index}_inference_time_ms: "
+            f"{float(response['inference_time_ms']):.2f}"
+        )
+
+
 def execute_cycle(args: argparse.Namespace) -> None:
+    if args.batch > 1:
+        execute_batch_timing_cycle(args)
+        return
+
     cycle_t0 = time.perf_counter()
 
     observation_t0 = time.perf_counter()
@@ -829,13 +891,15 @@ def main() -> None:
         raise ValueError("--execution-horizon-sec must be >= 0")
     if args.execution_settle_sec < 0.0:
         raise ValueError("--execution-settle-sec must be >= 0")
+    if args.batch < 1:
+        raise ValueError("--batch must be >= 1")
 
-    if args.continuous and args.send_mode == "chunk" and args.actions_per_chunk > 1:
+    if args.batch == 1 and args.continuous and args.send_mode == "chunk" and args.actions_per_chunk > 1:
         print(
             "warning: continuous+chunk mode replans only once per returned chunk. "
             "For tighter obstacle avoidance, prefer --send-mode first."
         )
-    if args.execution_mode == "task_execution" and args.send_mode != "first":
+    if args.batch == 1 and args.execution_mode == "task_execution" and args.send_mode != "first":
         print(
             "warning: task_execution mode is designed for --send-mode first. "
             "Chunk streaming still replans only after the whole chunk finishes."
@@ -850,7 +914,8 @@ def main() -> None:
     while args.max_cycles <= 0 or cycle_index < args.max_cycles:
         cycle_index += 1
         args._current_cycle_index = cycle_index
-        print(f"continuous_cycle: {cycle_index}")
+        if args.batch == 1:
+            print(f"continuous_cycle: {cycle_index}")
         execute_cycle(args)
 
 

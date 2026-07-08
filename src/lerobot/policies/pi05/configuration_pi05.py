@@ -76,6 +76,8 @@ class PI05Config(PreTrainedConfig):
     gradient_checkpointing: bool = False  # Enable gradient checkpointing for memory optimization
     compile_model: bool = False  # Whether to use torch.compile for model optimization
     compile_mode: str = "max-autotune"  # Torch compile mode
+    attention_implementation: str = "sdpa"  # Options: "sdpa", "eager"
+    past_key_values_copy: str = "shallow"  # Options: "shallow", "deep"
     device: str | None = None  # Device to use for the model (None = auto-detect)
 
     # Finetuning settings
@@ -115,6 +117,18 @@ class PI05Config(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+
+        if self.attention_implementation not in ["sdpa", "eager"]:
+            raise ValueError(
+                f"Invalid attention_implementation: {self.attention_implementation}. "
+                "Expected 'sdpa' or 'eager'."
+            )
+
+        if self.past_key_values_copy not in ["shallow", "deep"]:
+            raise ValueError(
+                f"Invalid past_key_values_copy: {self.past_key_values_copy}. "
+                "Expected 'shallow' or 'deep'."
+            )
 
         if self.num_action_samples < 1:
             raise ValueError(f"num_action_samples must be >= 1, got {self.num_action_samples}")

@@ -46,6 +46,18 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Default number of noise samples/action chunks to infer per observation.",
     )
+    parser.add_argument(
+        "--attention-implementation",
+        choices=["sdpa", "eager"],
+        default="sdpa",
+        help="Attention backend for PI0.5 inference. Use eager to reproduce the older slow path.",
+    )
+    parser.add_argument(
+        "--past-key-values-copy",
+        choices=["shallow", "deep"],
+        default="shallow",
+        help="Cache copy strategy for denoising steps. Use deep to reproduce the older behavior.",
+    )
     parser.add_argument("--compile-model", action="store_true")
     parser.add_argument(
         "--tokenizer-path",
@@ -176,6 +188,8 @@ def main() -> None:
         chunk_size=args.chunk_size,
         num_inference_steps=args.num_inference_steps,
         num_action_samples=args.default_num_action_samples,
+        attention_implementation=args.attention_implementation,
+        past_key_values_copy=args.past_key_values_copy,
         compile_model=args.compile_model,
         tokenizer_path=args.tokenizer_path,
         denoising_debug_dir=args.denoising_debug_dir,
@@ -192,6 +206,8 @@ def main() -> None:
     )
     print(f"PI05 server listening on {args.host}:{args.port}", flush=True)
     print(f"default_num_action_samples: {args.default_num_action_samples}", flush=True)
+    print(f"attention_implementation: {args.attention_implementation}", flush=True)
+    print(f"past_key_values_copy: {args.past_key_values_copy}", flush=True)
     if args.denoising_debug_dir:
         print(f"Denoising debug dumps will be saved to {Path(args.denoising_debug_dir).expanduser()}", flush=True)
     if args.reusable_noise_path:

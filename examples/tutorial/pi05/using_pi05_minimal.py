@@ -52,6 +52,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-inference-steps", type=int, default=10)
     parser.add_argument("--compile-model", action="store_true")
     parser.add_argument(
+        "--attention-implementation",
+        choices=["sdpa", "eager"],
+        default="sdpa",
+        help="Attention backend for PI0.5 inference. Use eager to reproduce the older slow path.",
+    )
+    parser.add_argument(
+        "--past-key-values-copy",
+        choices=["shallow", "deep"],
+        default="shallow",
+        help="Cache copy strategy for denoising steps. Use deep to reproduce the older behavior.",
+    )
+    parser.add_argument(
         "--tokenizer-path",
         default=None,
         help="Optional local tokenizer directory. Defaults to <model-id>/tokenizer when present.",
@@ -93,6 +105,8 @@ def build_config(args: argparse.Namespace, device: torch.device) -> PI05Config:
         dtype=dtype,
         num_inference_steps=args.num_inference_steps,
         compile_model=args.compile_model,
+        attention_implementation=args.attention_implementation,
+        past_key_values_copy=args.past_key_values_copy,
         input_features={
             "observation.images.front": PolicyFeature(
                 type=FeatureType.VISUAL,

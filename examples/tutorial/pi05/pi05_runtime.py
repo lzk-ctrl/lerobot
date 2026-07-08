@@ -703,6 +703,8 @@ class PI05InferenceEngine:
         chunk_size: int = 50,
         num_inference_steps: int = 10,
         num_action_samples: int = 1,
+        attention_implementation: str = "sdpa",
+        past_key_values_copy: str = "shallow",
         compile_model: bool = False,
         tokenizer_path: str | None = None,
         denoising_debug_dir: str | None = None,
@@ -739,6 +741,8 @@ class PI05InferenceEngine:
             n_action_steps=chunk_size,
             num_inference_steps=num_inference_steps,
             num_action_samples=num_action_samples,
+            attention_implementation=attention_implementation,
+            past_key_values_copy=past_key_values_copy,
             compile_model=compile_model,
             rtc_config=rtc_config,
             input_features={

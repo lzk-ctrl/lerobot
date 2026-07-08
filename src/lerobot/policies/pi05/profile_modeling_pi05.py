@@ -226,6 +226,53 @@ def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
     return padded_images
 
 
+def sdpa_attention_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    scaling: float,
+    dropout: float = 0.0,
+):
+    """SDPA equivalent of Gemma eager attention for the hand-written PI0.5 dual stream."""
+    key_states = modeling_gemma.repeat_kv(key, module.num_key_value_groups)
+    value_states = modeling_gemma.repeat_kv(value, module.num_key_value_groups)
+    if attention_mask is not None and attention_mask.dtype != query.dtype:
+        attention_mask = attention_mask.to(dtype=query.dtype)
+    attn_output = F.scaled_dot_product_attention(
+        query,
+        key_states,
+        value_states,
+        attn_mask=attention_mask,
+        dropout_p=dropout,
+        is_causal=False,
+        scale=scaling,
+    )
+    return attn_output.transpose(1, 2).contiguous(), None
+
+
+def pi05_attention_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    scaling: float,
+):
+    if getattr(module.config, "_attn_implementation", "eager") == "sdpa":
+        dropout = 0.0 if not module.training else module.attention_dropout
+        return sdpa_attention_forward(module, query, key, value, attention_mask, scaling, dropout)
+    return modeling_gemma.eager_attention_forward(
+        module,
+        query,
+        key,
+        value,
+        attention_mask,
+        scaling,
+    )
+
+
 # Define the complete layer computation function for gradient checkpointing
 def compute_layer_complete(
     layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond, paligemma, gemma_expert
@@ -265,7 +312,7 @@ def compute_layer_complete(
     batch_size = query_states.shape[0]
     scaling = paligemma.model.language_model.layers[layer_idx].self_attn.scaling
     # Attention computation
-    att_output, _ = modeling_gemma.eager_attention_forward(
+    att_output, _ = pi05_attention_forward(
         paligemma.model.language_model.layers[layer_idx].self_attn,
         query_states,
         key_states,
@@ -464,6 +511,8 @@ class PaliGemmaWithExpertModel(
         if adarms_cond is None:
             adarms_cond = [None, None]
         if inputs_embeds[1] is None:
+            if attention_mask is not None and attention_mask.dtype != inputs_embeds[0].dtype:
+                attention_mask = attention_mask.to(dtype=inputs_embeds[0].dtype)
             prefix_output = self.paligemma.model.language_model.forward(
                 inputs_embeds=inputs_embeds[0],
                 attention_mask=attention_mask,
@@ -476,6 +525,8 @@ class PaliGemmaWithExpertModel(
             prefix_output = prefix_output.last_hidden_state
             suffix_output = None
         elif inputs_embeds[0] is None:
+            if attention_mask is not None and attention_mask.dtype != inputs_embeds[1].dtype:
+                attention_mask = attention_mask.to(dtype=inputs_embeds[1].dtype)
             suffix_output = self.gemma_expert.model.forward(
                 inputs_embeds=inputs_embeds[1],
                 attention_mask=attention_mask,
@@ -576,6 +627,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             freeze_vision_encoder=config.freeze_vision_encoder,
             train_expert_only=config.train_expert_only,
         )
+        self._set_attention_implementation(config.attention_implementation)
 
         self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, config.max_action_dim)
@@ -611,6 +663,18 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
     def _rtc_enabled(self):
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
+
+    def _set_attention_implementation(self, attention_implementation: str) -> None:
+        self.paligemma_with_expert.paligemma.config.text_config._attn_implementation = (
+            attention_implementation
+        )
+        self.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = (
+            attention_implementation
+        )
+        self.paligemma_with_expert.gemma_expert.config._attn_implementation = attention_implementation
+        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = (
+            attention_implementation
+        )
 
     def _apply_checkpoint(self, func, *args, **kwargs):
         """Helper method to apply gradient checkpointing if enabled."""
@@ -661,7 +725,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             return cache_tensor
 
         if hasattr(past_key_values, "batch_repeat_interleave"):
-            repeated_cache = copy.deepcopy(past_key_values)
+            repeated_cache = self._shallow_copy_past_key_values(past_key_values)
             repeated_cache.batch_repeat_interleave(num_action_samples)
             return repeated_cache
 
@@ -686,6 +750,35 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             ]
 
         raise TypeError(f"Unsupported past_key_values type: {type(past_key_values)}")
+
+    def _shallow_copy_past_key_values(self, past_key_values):
+        """Copy cache containers while reusing immutable prefix K/V tensors."""
+        if past_key_values is None:
+            return None
+
+        if hasattr(past_key_values, "layers"):
+            copied_cache = copy.copy(past_key_values)
+            copied_cache.layers = [copy.copy(layer) for layer in past_key_values.layers]
+            return copied_cache
+
+        if hasattr(past_key_values, "key_cache") and hasattr(past_key_values, "value_cache"):
+            copied_cache = copy.copy(past_key_values)
+            copied_cache.key_cache = list(past_key_values.key_cache)
+            copied_cache.value_cache = list(past_key_values.value_cache)
+            return copied_cache
+
+        if isinstance(past_key_values, tuple):
+            return tuple(tuple(layer_cache) for layer_cache in past_key_values)
+
+        if isinstance(past_key_values, list):
+            return [tuple(layer_cache) for layer_cache in past_key_values]
+
+        return copy.copy(past_key_values)
+
+    def _copy_past_key_values_for_update(self, past_key_values):
+        if self.config.past_key_values_copy == "deep":
+            return copy.deepcopy(past_key_values)
+        return self._shallow_copy_past_key_values(past_key_values)
 
     def _prepare_noise_for_action_samples(self, noise, bsize, device, num_action_samples):
         if noise is None:
@@ -950,8 +1043,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
                 prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
 
-            self.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"  # noqa: SLF001
-
             with nvtx_range("pi05.model.sample_actions.prefix_forward"):
                 _, past_key_values = self.paligemma_with_expert.forward(
                     attention_mask=prefix_att_2d_masks_4d,
@@ -1040,10 +1131,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
                 full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
 
-            self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
-
-            with nvtx_range("pi05.model.denoise_step.deepcopy_kv"):
-                past_key_values = copy.deepcopy(past_key_values)
+            with nvtx_range("pi05.model.denoise_step.copy_kv"):
+                past_key_values = self._copy_past_key_values_for_update(past_key_values)
 
             with nvtx_range("pi05.model.denoise_step.forward"):
                 outputs_embeds, _ = self.paligemma_with_expert.forward(
