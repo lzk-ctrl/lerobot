@@ -10,7 +10,6 @@ import math
 import pickle
 import socket
 import struct
-import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -717,7 +716,6 @@ class PI05InferenceEngine:
         self.image_height = image_height
         self.image_width = image_width
         self.tokenizer_path = resolve_tokenizer_path(model_id, tokenizer_path)
-        self.lock = threading.Lock()
         self.denoising_debug_dir = Path(denoising_debug_dir).expanduser() if denoising_debug_dir else None
         self.reusable_noise_path = Path(reusable_noise_path).expanduser() if reusable_noise_path else None
         self._denoising_debug_request_idx = 0
@@ -848,123 +846,122 @@ class PI05InferenceEngine:
         request_noise_path = Path(initial_noise_path).expanduser() if initial_noise_path else None
         request_save_noise_path = Path(save_final_noise_path).expanduser() if save_final_noise_path else None
 
-        with self.lock:
-            with nvtx_range("pi05.engine.infer"):
-                with nvtx_range("pi05.engine.prepare_observation_for_inference"):
-                    obs = prepare_observation_for_inference(
-                        validated_observation,
-                        self.runtime_device,
-                        task=task,
-                    )
-
-                synchronize_if_needed(self.runtime_device)
-                t0 = time.perf_counter()
-
-                with nvtx_range("pi05.engine.preprocess"):
-                    processed_obs = self.preprocess(obs)
-
-                needs_debug_tracking = self.denoising_debug_dir is not None
-                effective_load_noise_path = request_noise_path
-                effective_save_noise_path = request_save_noise_path
-                if effective_load_noise_path is None:
-                    effective_load_noise_path = self.reusable_noise_path
-                if effective_save_noise_path is None:
-                    effective_save_noise_path = self.reusable_noise_path
-
-                needs_full_internal_action = (
-                    needs_debug_tracking
-                    or effective_load_noise_path is not None
-                    or effective_save_noise_path is not None
+        with nvtx_range("pi05.engine.infer"):
+            with nvtx_range("pi05.engine.prepare_observation_for_inference"):
+                obs = prepare_observation_for_inference(
+                    validated_observation,
+                    self.runtime_device,
+                    task=task,
                 )
-                initial_noise = None
-                noise_source = "model_random"
 
-                if needs_debug_tracking:
-                    if self.policy.rtc_processor is None or not self.policy.rtc_processor.is_debug_enabled():
-                        raise RuntimeError("Denoising debug was requested but RTC tracker is not enabled")
+            synchronize_if_needed(self.runtime_device)
+            t0 = time.perf_counter()
 
-                    self.policy.rtc_processor.reset_tracker()
+            with nvtx_range("pi05.engine.preprocess"):
+                processed_obs = self.preprocess(obs)
 
-                full_action_chunk = None
+            needs_debug_tracking = self.denoising_debug_dir is not None
+            effective_load_noise_path = request_noise_path
+            effective_save_noise_path = request_save_noise_path
+            if effective_load_noise_path is None:
+                effective_load_noise_path = self.reusable_noise_path
+            if effective_save_noise_path is None:
+                effective_save_noise_path = self.reusable_noise_path
+
+            needs_full_internal_action = (
+                needs_debug_tracking
+                or effective_load_noise_path is not None
+                or effective_save_noise_path is not None
+            )
+            initial_noise = None
+            noise_source = "model_random"
+
+            if needs_debug_tracking:
+                if self.policy.rtc_processor is None or not self.policy.rtc_processor.is_debug_enabled():
+                    raise RuntimeError("Denoising debug was requested but RTC tracker is not enabled")
+
+                self.policy.rtc_processor.reset_tracker()
+
+            full_action_chunk = None
+            if needs_full_internal_action:
+                batch_size = int(processed_obs["observation.state"].shape[0])
+                if num_action_samples == 1:
+                    noise_shape = (
+                        batch_size,
+                        self.policy.config.chunk_size,
+                        self.policy.config.max_action_dim,
+                    )
+                else:
+                    noise_shape = (
+                        batch_size,
+                        num_action_samples,
+                        self.policy.config.chunk_size,
+                        self.policy.config.max_action_dim,
+                    )
+                if effective_load_noise_path is not None:
+                    if not effective_load_noise_path.is_file():
+                        raise FileNotFoundError(
+                            f"Initial noise file not found: {effective_load_noise_path}"
+                        )
+                    initial_noise = _load_noise_tensor(
+                        effective_load_noise_path,
+                        expected_shape=noise_shape,
+                        device=self.runtime_device,
+                    )
+                    noise_source = "provided_file"
+                else:
+                    initial_noise = self.policy.model.sample_noise(noise_shape, self.runtime_device)
+                    noise_source = "random_sampled"
+
+            with nvtx_range("pi05.engine.predict_action_chunk"):
+                predict_kwargs: dict[str, Any] = {}
+                if initial_noise is not None:
+                    predict_kwargs["noise"] = initial_noise
+                predict_kwargs["num_action_samples"] = num_action_samples
+
                 if needs_full_internal_action:
-                    batch_size = int(processed_obs["observation.state"].shape[0])
-                    if num_action_samples == 1:
-                        noise_shape = (
-                            batch_size,
-                            self.policy.config.chunk_size,
-                            self.policy.config.max_action_dim,
-                        )
+                    images, img_masks = self.policy._preprocess_images(processed_obs)
+                    tokens = processed_obs[OBS_LANGUAGE_TOKENS]
+                    masks = processed_obs[OBS_LANGUAGE_ATTENTION_MASK]
+                    full_action_chunk = self.policy.model.sample_actions(
+                        images,
+                        img_masks,
+                        tokens,
+                        masks,
+                        **predict_kwargs,
+                    )
+                    original_action_dim = self.policy.config.output_features[ACTION].shape[0]
+                    if full_action_chunk.ndim == 4:
+                        action_chunk = full_action_chunk[:, :, :requested_actions, :original_action_dim]
                     else:
-                        noise_shape = (
-                            batch_size,
-                            num_action_samples,
-                            self.policy.config.chunk_size,
-                            self.policy.config.max_action_dim,
-                        )
-                    if effective_load_noise_path is not None:
-                        if not effective_load_noise_path.is_file():
-                            raise FileNotFoundError(
-                                f"Initial noise file not found: {effective_load_noise_path}"
-                            )
-                        initial_noise = _load_noise_tensor(
-                            effective_load_noise_path,
-                            expected_shape=noise_shape,
-                            device=self.runtime_device,
-                        )
-                        noise_source = "provided_file"
-                    else:
-                        initial_noise = self.policy.model.sample_noise(noise_shape, self.runtime_device)
-                        noise_source = "random_sampled"
-
-                with nvtx_range("pi05.engine.predict_action_chunk"):
-                    predict_kwargs: dict[str, Any] = {}
-                    if initial_noise is not None:
-                        predict_kwargs["noise"] = initial_noise
-                    predict_kwargs["num_action_samples"] = num_action_samples
-
-                    if needs_full_internal_action:
-                        images, img_masks = self.policy._preprocess_images(processed_obs)
-                        tokens = processed_obs[OBS_LANGUAGE_TOKENS]
-                        masks = processed_obs[OBS_LANGUAGE_ATTENTION_MASK]
-                        full_action_chunk = self.policy.model.sample_actions(
-                            images,
-                            img_masks,
-                            tokens,
-                            masks,
-                            **predict_kwargs,
-                        )
-                        original_action_dim = self.policy.config.output_features[ACTION].shape[0]
-                        if full_action_chunk.ndim == 4:
-                            action_chunk = full_action_chunk[:, :, :requested_actions, :original_action_dim]
-                        else:
-                            action_chunk = full_action_chunk[:, :requested_actions, :original_action_dim]
-                    else:
-                        action_chunk = self.policy.predict_action_chunk(processed_obs, **predict_kwargs)
-                        if action_chunk.ndim == 4:
-                            action_chunk = action_chunk[:, :, :requested_actions, :]
-                        else:
-                            action_chunk = action_chunk[:, :requested_actions, :]
-
-                with nvtx_range("pi05.engine.postprocess"):
+                        action_chunk = full_action_chunk[:, :requested_actions, :original_action_dim]
+                else:
+                    action_chunk = self.policy.predict_action_chunk(processed_obs, **predict_kwargs)
                     if action_chunk.ndim == 4:
-                        processed_samples = []
-                        for sample_idx in range(action_chunk.shape[1]):
-                            processed_actions = []
-                            for idx in range(action_chunk.shape[2]):
-                                processed_action = self.postprocess(action_chunk[:, sample_idx, idx, :])
-                                processed_actions.append(processed_action)
-                            processed_samples.append(torch.stack(processed_actions, dim=1))
-                        action_tensor = torch.stack(processed_samples, dim=1).squeeze(0)
+                        action_chunk = action_chunk[:, :, :requested_actions, :]
                     else:
+                        action_chunk = action_chunk[:, :requested_actions, :]
+
+            with nvtx_range("pi05.engine.postprocess"):
+                if action_chunk.ndim == 4:
+                    processed_samples = []
+                    for sample_idx in range(action_chunk.shape[1]):
                         processed_actions = []
-                        for idx in range(action_chunk.shape[1]):
-                            processed_action = self.postprocess(action_chunk[:, idx, :])
+                        for idx in range(action_chunk.shape[2]):
+                            processed_action = self.postprocess(action_chunk[:, sample_idx, idx, :])
                             processed_actions.append(processed_action)
+                        processed_samples.append(torch.stack(processed_actions, dim=1))
+                    action_tensor = torch.stack(processed_samples, dim=1).squeeze(0)
+                else:
+                    processed_actions = []
+                    for idx in range(action_chunk.shape[1]):
+                        processed_action = self.postprocess(action_chunk[:, idx, :])
+                        processed_actions.append(processed_action)
 
-                        action_tensor = torch.stack(processed_actions, dim=1).squeeze(0)
+                    action_tensor = torch.stack(processed_actions, dim=1).squeeze(0)
 
-                synchronize_if_needed(self.runtime_device)
-                dt_ms = (time.perf_counter() - t0) * 1000.0
+            synchronize_if_needed(self.runtime_device)
+            dt_ms = (time.perf_counter() - t0) * 1000.0
 
         with nvtx_range("pi05.engine.to_numpy"):
             action_np = action_tensor.detach().cpu().numpy()
